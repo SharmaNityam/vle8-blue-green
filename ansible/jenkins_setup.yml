@@ -40,8 +40,8 @@
 
     - name: Start Minikube cluster (as ubuntu)
       shell: sudo -iu ubuntu minikube start --driver=docker --cpus=2 --memory=4096
-      args:
-        creates: /home/ubuntu/.minikube/profiles/minikube/config.json
+      register: minikube
+      changed_when: "'Done!' in minikube.stdout"
 
     - name: Add Jenkins apt key
       get_url:
@@ -58,6 +58,12 @@
         name: jenkins
         state: present
         update_cache: yes
+
+    - name: Create Jenkins config directories
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop: [/etc/systemd/system/jenkins.service.d, /var/lib/jenkins/init.groovy.d]
 
     - name: Run Jenkins as ubuntu (so it can use docker + minikube), skip setup wizard
       copy:
