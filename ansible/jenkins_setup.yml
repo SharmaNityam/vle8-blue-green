@@ -3,7 +3,7 @@
 - hosts: all
   become: yes
   vars:
-    jenkins_admin_password: vle7-admin
+    jenkins_admin_password: "{{ lookup('env', 'JENKINS_ADMIN_PASSWORD') | mandatory }}"
     repo_url: https://github.com/SharmaNityam/vle8-blue-green.git
     jenkins_cli: "java -jar /opt/jenkins-cli.jar -s http://localhost:8080 -auth admin:{{ jenkins_admin_password }}"
   tasks:
