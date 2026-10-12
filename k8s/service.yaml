@@ -1,0 +1,14 @@
+# Live traffic. The color in the selector decides which environment serves users.
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-service
+spec:
+  type: NodePort
+  selector:
+    app: myapp
+    color: blue   # Initially blue
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 30080

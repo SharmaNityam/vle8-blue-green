@@ -1,0 +1,177 @@
+# Configure the Jenkins server for Blue-Green deployments
+# (Docker, Jenkins, kubectl, Minikube) - runs over AWS SSM, no SSH needed
+- hosts: all
+  become: yes
+  vars:
+    jenkins_admin_password: vle7-admin
+    repo_url: https://github.com/SharmaNityam/vle8-blue-green.git
+    jenkins_cli: "java -jar /opt/jenkins-cli.jar -s http://localhost:8080 -auth admin:{{ jenkins_admin_password }}"
+  tasks:
+    - name: Install Docker
+      apt:
+        name: [docker.io, git, curl, socat, conntrack, openjdk-21-jre-headless]
+        state: present
+        update_cache: yes
+
+    - name: Start Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ubuntu to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Install kubectl
+      shell: |
+        curl -sLo /tmp/kubectl "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        install /tmp/kubectl /usr/local/bin/kubectl
+      args:
+        creates: /usr/local/bin/kubectl
+
+    - name: Install Minikube
+      get_url:
+        url: https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        dest: /usr/local/bin/minikube
+        mode: "0755"
+
+    - name: Start Minikube cluster (as ubuntu)
+      shell: sudo -iu ubuntu minikube start --driver=docker --cpus=2 --memory=4096
+      args:
+        creates: /home/ubuntu/.minikube/profiles/minikube/config.json
+
+    - name: Add Jenkins apt key
+      get_url:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key
+        dest: /usr/share/keyrings/jenkins-keyring.asc
+
+    - name: Add Jenkins repository
+      apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/"
+        filename: jenkins
+
+    - name: Install Jenkins
+      apt:
+        name: jenkins
+        state: present
+        update_cache: yes
+
+    - name: Run Jenkins as ubuntu (so it can use docker + minikube), skip setup wizard
+      copy:
+        dest: /etc/systemd/system/jenkins.service.d/override.conf
+        content: |
+          [Service]
+          User=ubuntu
+          Group=ubuntu
+          Environment="JAVA_OPTS=-Djava.awt.headless=true -Djenkins.install.runSetupWizard=false"
+
+    - name: Create admin user and set Jenkins URL on startup
+      copy:
+        dest: /var/lib/jenkins/init.groovy.d/setup.groovy
+        content: |
+          import jenkins.model.*
+          import hudson.security.*
+          def realm = new HudsonPrivateSecurityRealm(false)
+          def admin = hudson.model.User.getById("admin", false)
+          if (admin == null) { realm.createAccount("admin", "{{ jenkins_admin_password }}") }
+          else { admin.addProperty(HudsonPrivateSecurityRealm.Details.fromPlainPassword("{{ jenkins_admin_password }}")) }
+          Jenkins.get().setSecurityRealm(realm)
+          def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+          strategy.setAllowAnonymousRead(false)
+          Jenkins.get().setAuthorizationStrategy(strategy)
+          JenkinsLocationConfiguration.get().setUrl("http://localhost:8080/")
+          Jenkins.get().save()
+
+    - name: Give ubuntu ownership of Jenkins directories
+      file:
+        path: "{{ item }}"
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+      loop: [/var/lib/jenkins, /var/cache/jenkins, /var/log/jenkins]
+
+    - name: Restart Jenkins
+      systemd:
+        name: jenkins
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for Jenkins
+      uri:
+        url: http://localhost:8080/login
+      register: jl
+      until: jl.status == 200
+      retries: 60
+      delay: 5
+
+    - name: Download Jenkins CLI
+      get_url:
+        url: http://localhost:8080/jnlpJars/jenkins-cli.jar
+        dest: /opt/jenkins-cli.jar
+
+    - name: Install Jenkins plugins
+      shell: "{{ jenkins_cli }} install-plugin workflow-aggregator git docker-workflow pipeline-stage-view pipeline-graph-view -restart"
+
+    - name: Wait for Jenkins after plugin restart
+      shell: "{{ jenkins_cli }} list-plugins | grep -q '^workflow-cps '"
+      register: pl
+      until: pl.rc == 0
+      retries: 60
+      delay: 5
+
+    - name: Create the blue-green pipeline job
+      shell: |
+        cat > /tmp/job.xml <<'XML'
+        <?xml version='1.1' encoding='UTF-8'?>
+        <flow-definition plugin="workflow-job">
+          <description>VLE-8: Blue-Green deployment of myapp (build Green, test, switch traffic)</description>
+          <properties>
+            <org.jenkinsci.plugins.workflow.job.properties.PipelineTriggersJobProperty>
+              <triggers><hudson.triggers.SCMTrigger><spec>H/2 * * * *</spec></hudson.triggers.SCMTrigger></triggers>
+            </org.jenkinsci.plugins.workflow.job.properties.PipelineTriggersJobProperty>
+          </properties>
+          <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition" plugin="workflow-cps">
+            <scm class="hudson.plugins.git.GitSCM" plugin="git">
+              <configVersion>2</configVersion>
+              <userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>{{ repo_url }}</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs>
+              <branches><hudson.plugins.git.BranchSpec><name>*/main</name></hudson.plugins.git.BranchSpec></branches>
+            </scm>
+            <scriptPath>Jenkinsfile</scriptPath>
+            <lightweight>true</lightweight>
+          </definition>
+        </flow-definition>
+        XML
+        {{ jenkins_cli }} get-job bluegreen-pipeline >/dev/null 2>&1 || {{ jenkins_cli }} create-job bluegreen-pipeline < /tmp/job.xml
+
+    - name: Advertise the public Jenkins URL
+      shell: |
+        echo "jenkins.model.JenkinsLocationConfiguration.get().setUrl('http://{{ public_ip }}:8080/')" | {{ jenkins_cli }} groovy =
+        sed -i '/JenkinsLocationConfiguration/d' /var/lib/jenkins/init.groovy.d/setup.groovy
+
+    - name: Forward host ports to the Minikube NodePorts (8000 = live, 8001 = green preview)
+      copy:
+        dest: "/etc/systemd/system/bluegreen-fwd-{{ item.host }}.service"
+        content: |
+          [Unit]
+          Description=Forward :{{ item.host }} -> minikube:{{ item.node }}
+          After=docker.service
+          [Service]
+          ExecStart=/bin/bash -c 'exec /usr/bin/socat TCP-LISTEN:{{ item.host }},fork,reuseaddr TCP:$(sudo -iu ubuntu minikube ip):{{ item.node }}'
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+      loop:
+        - { host: 8000, node: 30080 }
+        - { host: 8001, node: 30081 }
+
+    - name: Enable port forwards
+      systemd:
+        name: "bluegreen-fwd-{{ item }}"
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      loop: [8000, 8001]
